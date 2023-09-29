@@ -11,6 +11,8 @@ import chromadb
 import openai  # Import the OpenAI library
 import uuid
 from datetime import datetime
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import logging
 
 # Load .env file
 load_dotenv()
@@ -29,14 +31,17 @@ chroma_client = chromadb.HttpClient(host="localhost", port=8000)
 # Define the collection name
 collection_name = "pdf_embeddings"
 
-# Get the list of existing collections
-existing_collections = chroma_client.list_collections()
+# logging
+logging.basicConfig(level=logging.INFO)
 
 # Check if the collection_name is in the list of existing collections
 try:
-    documents = chroma_client.get_collection(collection_name).get(include=["metadatas", "documents"])
+    chroma_client.get_collection(collection_name)
 except Exception as e:
     chroma_client.create_collection(collection_name)
+
+# Initialize Recursive Text Splitter with a smaller chunk size
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=400)
 
 def text_embedding(text):
     response = openai.Embedding.create(model=embedding_model_name, input=text)
@@ -58,24 +63,59 @@ def main():
         try:
             pdf_file = BytesIO(uploaded_file.read())
             pdf_text = extract_text_from_pdf(pdf_file)
+            
+            # Manually split the extracted text into smaller chunks
+            chunk_size = 2000  # Number of characters in each chunk
+            chunk_overlap = 400  # Number of overlapping characters between consecutive chunks
+            documents_str_list = []
+            start_idx = 0
+            while start_idx < len(pdf_text):
+                end_idx = min(start_idx + chunk_size, len(pdf_text))
+                chunk = pdf_text[start_idx:end_idx]
+                documents_str_list.append(chunk)
+                start_idx = end_idx - chunk_overlap
+                if end_idx == len(pdf_text):
+                    break
+            
+            logging.info(f"Number of chunks created: {len(documents_str_list)}")
+            
+            # Create a progress bar
+            progress_bar = st.progress(0)
+            
+            # Create embeddings for each chunk and add them to the collection
+            for i, chunk in enumerate(documents_str_list):
+                # Update the progress bar
+                progress_bar.progress((i + 1) / len(documents_str_list))
+                document_id = f"{uuid.uuid4()}_chunk_{i}"
+                metadata = {"title": uploaded_file.name, "upload_timestamp": datetime.utcnow().isoformat(), "chunk_id": document_id}
+                
+                # Log the length of each chunk
+                logging.info(f"Length of Chunk {i}: {len(chunk)}")
+                
+                # Display progress message on Streamlit GUI
+                st.text(f"Creating embedding for chunk {i}...")
+                
+                embedding = text_embedding(chunk)
+                
+                # Log the size and a sample of the embedding
+                logging.info(f"Embedding for chunk {i}: Size: {len(embedding)}, Sample: {embedding[:5]}")
+                
+                # Get the collection object
+                collection = chroma_client.get_collection(collection_name)
+                
+                # Add the embedding to the collection, ensuring that only serializable data is added
+                collection.add(ids=[document_id], embeddings=[embedding], metadatas=[metadata])
+            
             st.text_area("Extracted Text", pdf_text)
-            document_id = str(uuid.uuid4())
-            metadata = {"title": uploaded_file.name, "upload_timestamp": datetime.utcnow().isoformat()}
-            
-            # Create the embedding using the text_embedding function
-            embedding = text_embedding(pdf_text)
-            
-            # Get the collection object
-            collection = chroma_client.get_collection(collection_name)
-            
-            # Add the embedding to the collection
-            collection.add(ids=[document_id], embeddings=[embedding], metadatas=[metadata])
             
             user_query = st.text_input("Ask a question about the uploaded document:")
             
             if user_query and pdf_text.strip():
                 query_embedding = text_embedding(user_query)
                 results = collection.query(query_embeddings=[query_embedding], n_results=5)
+                
+                # Handle the results and generate the response here
+                # since you now have multiple chunks/documents in the collection.
                 
                 prompt_template = PromptTemplate.from_template("{document_text}\n{user_query}")
                 formatted_prompt = prompt_template.format(document_text=pdf_text, user_query=user_query)
@@ -88,4 +128,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
