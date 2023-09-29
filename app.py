@@ -11,7 +11,6 @@ import chromadb
 import openai  # Import the OpenAI library
 import uuid
 from datetime import datetime
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 import logging
 
 # Load .env file
@@ -40,9 +39,6 @@ try:
 except Exception as e:
     chroma_client.create_collection(collection_name)
 
-# Initialize Recursive Text Splitter with a smaller chunk size
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=400)
-
 def text_embedding(text):
     response = openai.Embedding.create(model=embedding_model_name, input=text)
     return response["data"][0]["embedding"]
@@ -55,6 +51,21 @@ def extract_text_from_pdf(pdf_file):
         text += page.extract_text()
     return text
 
+def split_text_into_chunks(text, chunk_size=2000, chunk_overlap=400):
+    chunks = []
+    current_chunk = ""
+    overlap_text = ""
+    sentences = text.split('. ')  # Simple sentence splitting based on periods
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) > chunk_size:
+            chunks.append(current_chunk.strip())
+            current_chunk = overlap_text
+        current_chunk += sentence + ". "
+        overlap_text = " ".join(current_chunk.split()[-chunk_overlap:])
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+    return chunks
+
 def main():
     st.title('ChatGPT-powered PDF Chatbot')
     uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
@@ -64,18 +75,8 @@ def main():
             pdf_file = BytesIO(uploaded_file.read())
             pdf_text = extract_text_from_pdf(pdf_file)
             
-            # Manually split the extracted text into smaller chunks
-            chunk_size = 2000  # Number of characters in each chunk
-            chunk_overlap = 400  # Number of overlapping characters between consecutive chunks
-            documents_str_list = []
-            start_idx = 0
-            while start_idx < len(pdf_text):
-                end_idx = min(start_idx + chunk_size, len(pdf_text))
-                chunk = pdf_text[start_idx:end_idx]
-                documents_str_list.append(chunk)
-                start_idx = end_idx - chunk_overlap
-                if end_idx == len(pdf_text):
-                    break
+            # Use the refined text splitting logic
+            documents_str_list = split_text_into_chunks(pdf_text)
             
             logging.info(f"Number of chunks created: {len(documents_str_list)}")
             
@@ -111,20 +112,47 @@ def main():
             user_query = st.text_input("Ask a question about the uploaded document:")
             
             if user_query and pdf_text.strip():
+                # Adjust the n_results parameter
+                n_results = st.slider('Number of Results to Retrieve', min_value=1, max_value=10, value=5)
+                
                 query_embedding = text_embedding(user_query)
-                results = collection.query(query_embeddings=[query_embedding], n_results=5)
+                results = collection.query(query_embeddings=[query_embedding], n_results=n_results)
                 
-                # Handle the results and generate the response here
-                # since you now have multiple chunks/documents in the collection.
+                # Retrieve the actual text content of the chunk/document
+                aggregated_text = ""
+                for result in results:
+                    document_id = result['id']
+                    metadata = result['metadata']
+                    
+                    # Retrieve the actual text content using metadata or other means
+                    chunk_id = metadata.get('chunk_id')
+                    chunk_index = int(chunk_id.split('_')[-1])  # Extracting index from chunk_id
+                    chunk_text = documents_str_list[chunk_index]  # Getting the actual chunk text using the index
+                    
+                    aggregated_text += chunk_text + "\n"
                 
+                # Implement additional logic to prioritize or filter the retrieved chunks/documents
+                sorted_results = sorted(results, key=lambda x: x['score'], reverse=True)
+                
+                # Aggregate the sorted results
+                aggregated_text = ""
+                for result in sorted_results:
+                    document_id = result['id']
+                    metadata = result['metadata']
+                    chunk_id = metadata.get('chunk_id')
+                    chunk_index = int(chunk_id.split('_')[-1])
+                    chunk_text = documents_str_list[chunk_index]
+                    aggregated_text += chunk_text + "\n"
+                
+                # Generate the response based on the aggregated text
                 prompt_template = PromptTemplate.from_template("{document_text}\n{user_query}")
-                formatted_prompt = prompt_template.format(document_text=pdf_text, user_query=user_query)
+                formatted_prompt = prompt_template.format(document_text=aggregated_text, user_query=user_query)
                 response = llm(formatted_prompt)
                 st.text_area("Response", response)
             
             st.success("File uploaded and processed successfully!")
         except Exception as e:
             st.error(f"An error occurred: {str(e)}")
-
+            
 if __name__ == "__main__":
     main()
